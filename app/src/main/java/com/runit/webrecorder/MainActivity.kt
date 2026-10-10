@@ -1,161 +1,215 @@
 package com.runit.webrecorder
 
-import android.annotation.SuppressLint
-import android.graphics.Bitmap
-import android.os.Bundle
-import android.view.KeyEvent
-import android.view.View
-import android.view.inputmethod.EditorInfo
-import android.view.inputmethod.InputMethodManager
-import android.webkit.WebChromeClient
-import android.webkit.WebSettings
-import android.webkit.WebView
-import android.webkit.WebViewClient
-import android.widget.Button
-import android.widget.EditText
-import android.widget.LinearLayout
-import android.widget.ProgressBar
-import androidx.activity.OnBackPressedCallback
-import androidx.appcompat.app.AppCompatActivity
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
+import android.app.Service
+import android.content.Intent
+import android.content.pm.ServiceInfo
+import android.hardware.display.DisplayManager
+import android.hardware.display.VirtualDisplay
+import android.media.MediaRecorder
+import android.media.projection.MediaProjection
+import android.media.projection.MediaProjectionManager
+import android.os.Build
+import android.os.Environment
+import android.os.Handler
+import android.os.IBinder
+import android.os.Looper
+import android.widget.Toast
+import androidx.core.app.NotificationCompat
+import java.io.File
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 
-class MainActivity : AppCompatActivity() {
+class RecorderService : Service() {
 
-    private lateinit var webView: WebView
-    private lateinit var urlBar: EditText
-    private lateinit var loadingBar: ProgressBar
+    companion object {
+        const val ACTION_START = "com.runit.webrecorder.START"
+        const val ACTION_STOP = "com.runit.webrecorder.STOP"
+        const val EXTRA_RESULT_CODE = "resultCode"
+        const val EXTRA_DATA = "data"
+        private const val CHANNEL_ID = "recorder"
+        private const val NOTIF_ID = 1
 
-    @SuppressLint("SetJavaScriptEnabled")
-    override fun onCreate(savedInstanceState: Bundle?) {
-        super.onCreate(savedInstanceState)
+        @Volatile
+        var isRecording = false
+    }
 
-        val root = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
+    private var projection: MediaProjection? = null
+    private var recorder: MediaRecorder? = null
+    private var virtualDisplay: VirtualDisplay? = null
+    private var outputFile: File? = null
+
+    override fun onBind(intent: Intent?): IBinder? = null
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        when (intent?.action) {
+            ACTION_START -> startRecording(intent)
+            ACTION_STOP -> stopRecording()
+            else -> stopSelf()
         }
+        return START_NOT_STICKY
+    }
 
-        // Top bar: URL box + Go button
-        val bar = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            setPadding(dp(8), dp(8), dp(8), dp(8))
-        }
+    private fun startRecording(intent: Intent) {
+        if (isRecording) return
 
-        urlBar = EditText(this).apply {
-            hint = "Search or enter URL"
-            setSingleLine(true)
-            imeOptions = EditorInfo.IME_ACTION_GO
-            setOnEditorActionListener { _, actionId, event ->
-                val enterPressed = event != null &&
-                    event.keyCode == KeyEvent.KEYCODE_ENTER &&
-                    event.action == KeyEvent.ACTION_DOWN
-                if (actionId == EditorInfo.IME_ACTION_GO || enterPressed) {
-                    go()
-                    true
-                } else {
-                    false
-                }
-            }
-        }
-        bar.addView(
-            urlBar,
-            LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
-        )
-
-        val goBtn = Button(this).apply {
-            text = "Go"
-            setOnClickListener { go() }
-        }
-        bar.addView(
-            goBtn,
-            LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.WRAP_CONTENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT
+        createChannel()
+        val notification = buildNotification()
+        if (Build.VERSION.SDK_INT >= 29) {
+            startForeground(
+                NOTIF_ID,
+                notification,
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
             )
-        )
-        root.addView(bar)
-
-        // Loading bar
-        loadingBar = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal)
-        loadingBar.max = 100
-        loadingBar.visibility = View.GONE
-        root.addView(
-            loadingBar,
-            LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(3))
-        )
-
-        // WebView
-        val wv = WebView(this)
-        wv.settings.javaScriptEnabled = true
-        wv.settings.domStorageEnabled = true
-        wv.settings.mediaPlaybackRequiresUserGesture = false
-        wv.settings.mixedContentMode = WebSettings.MIXED_CONTENT_COMPATIBILITY_MODE
-        wv.settings.setSupportZoom(true)
-        wv.settings.builtInZoomControls = true
-        wv.settings.displayZoomControls = false
-
-        wv.webViewClient = object : WebViewClient() {
-            override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
-                loadingBar.visibility = View.VISIBLE
-                if (url != null) urlBar.setText(url)
-            }
-
-            override fun onPageFinished(view: WebView?, url: String?) {
-                loadingBar.visibility = View.GONE
-            }
+        } else {
+            startForeground(NOTIF_ID, notification)
         }
 
-        wv.webChromeClient = object : WebChromeClient() {
-            override fun onProgressChanged(view: WebView?, newProgress: Int) {
-                loadingBar.progress = newProgress
-            }
+        val resultCode = intent.getIntExtra(EXTRA_RESULT_CODE, 0)
+        val data: Intent? = if (Build.VERSION.SDK_INT >= 33) {
+            intent.getParcelableExtra(EXTRA_DATA, Intent::class.java)
+        } else {
+            @Suppress("DEPRECATION")
+            intent.getParcelableExtra(EXTRA_DATA)
         }
 
-        webView = wv
-        root.addView(
-            webView,
-            LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
+        if (data == null) {
+            toast("Recording failed: no permission data")
+            stopSelf()
+            return
+        }
+
+        try {
+            val mpm = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+            val proj = mpm.getMediaProjection(resultCode, data)
+            projection = proj
+
+            // Required on Android 14+ before creating the virtual display
+            proj.registerCallback(object : MediaProjection.Callback() {
+                override fun onStop() {
+                    stopRecording()
+                }
+            }, Handler(Looper.getMainLooper()))
+
+            val metrics = resources.displayMetrics
+            val width = metrics.widthPixels / 2 * 2
+            val height = metrics.heightPixels / 2 * 2
+            val dpi = metrics.densityDpi
+
+            val dir = getExternalFilesDir(Environment.DIRECTORY_MOVIES) ?: filesDir
+            dir.mkdirs()
+            val stamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
+            val file = File(dir, "rec_$stamp.mp4")
+            outputFile = file
+
+            val rec = if (Build.VERSION.SDK_INT >= 31) MediaRecorder(this) else MediaRecorder()
+            rec.setVideoSource(MediaRecorder.VideoSource.SURFACE)
+            rec.setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
+            rec.setVideoEncoder(MediaRecorder.VideoEncoder.H264)
+            rec.setVideoSize(width, height)
+            rec.setVideoFrameRate(30)
+            rec.setVideoEncodingBitRate(4_000_000)
+            rec.setOutputFile(file.absolutePath)
+            rec.prepare()
+            recorder = rec
+
+            virtualDisplay = proj.createVirtualDisplay(
+                "WebRecorder",
+                width,
+                height,
+                dpi,
+                DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
+                rec.surface,
+                null,
+                null
+            )
+
+            rec.start()
+            isRecording = true
+            toast("Recording started")
+        } catch (e: Exception) {
+            toast("Recording failed: ${e.message}")
+            cleanup()
+            stopSelf()
+        }
+    }
+
+    private fun stopRecording() {
+        if (!isRecording) {
+            cleanup()
+            stopSelf()
+            return
+        }
+        isRecording = false
+
+        try {
+            recorder?.stop()
+        } catch (e: RuntimeException) {
+            // stopped too quickly, file may be empty
+            outputFile?.delete()
+            outputFile = null
+        }
+
+        val saved = outputFile
+        cleanup()
+
+        if (saved != null) {
+            toast("Saved: ${saved.name}")
+        }
+        stopForeground(STOP_FOREGROUND_REMOVE)
+        stopSelf()
+    }
+
+    private fun cleanup() {
+        try { recorder?.release() } catch (_: Exception) {}
+        recorder = null
+        try { virtualDisplay?.release() } catch (_: Exception) {}
+        virtualDisplay = null
+        try { projection?.stop() } catch (_: Exception) {}
+        projection = null
+        isRecording = false
+    }
+
+    private fun createChannel() {
+        if (Build.VERSION.SDK_INT >= 26) {
+            val nm = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
+            val channel = NotificationChannel(
+                CHANNEL_ID,
+                "Screen recording",
+                NotificationManager.IMPORTANCE_LOW
+            )
+            nm.createNotificationChannel(channel)
+        }
+    }
+
+    private fun buildNotification() = NotificationCompat.Builder(this, CHANNEL_ID)
+        .setSmallIcon(android.R.drawable.presence_video_online)
+        .setContentTitle("Web Recorder")
+        .setContentText("Recording screen...")
+        .setOngoing(true)
+        .addAction(
+            android.R.drawable.ic_media_pause,
+            "Stop",
+            PendingIntent.getService(
+                this,
                 0,
-                1f
+                Intent(this, RecorderService::class.java).setAction(ACTION_STOP),
+                PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
             )
         )
+        .build()
 
-        setContentView(root)
-
-        // Back button goes back in page history first
-        onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
-            override fun handleOnBackPressed() {
-                if (webView.canGoBack()) {
-                    webView.goBack()
-                } else {
-                    finish()
-                }
-            }
-        })
-
-        webView.loadUrl("https://www.google.com")
-    }
-
-    private fun go() {
-        val input = urlBar.text.toString().trim()
-        if (input.isEmpty()) return
-
-        val url = when {
-            input.startsWith("http://") || input.startsWith("https://") -> input
-            input.contains(" ") || !input.contains(".") ->
-                "https://www.google.com/search?q=" + java.net.URLEncoder.encode(input, "UTF-8")
-            else -> "https://$input"
+    private fun toast(msg: String) {
+        Handler(Looper.getMainLooper()).post {
+            Toast.makeText(applicationContext, msg, Toast.LENGTH_SHORT).show()
         }
-        webView.loadUrl(url)
-
-        val imm = getSystemService(INPUT_METHOD_SERVICE) as InputMethodManager
-        imm.hideSoftInputFromWindow(urlBar.windowToken, 0)
-        urlBar.clearFocus()
     }
-
-    private fun dp(value: Int): Int =
-        (value * resources.displayMetrics.density).toInt()
 
     override fun onDestroy() {
-        webView.destroy()
+        cleanup()
         super.onDestroy()
     }
 }
