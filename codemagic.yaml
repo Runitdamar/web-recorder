@@ -1,0 +1,17 @@
+workflows:
+  debug-apk:
+    name: Debug APK
+    instance_type: linux_x2
+    max_build_duration: 30
+    environment:
+      java: 17
+    scripts:
+      - name: Install Gradle 8.7
+        script: |
+          curl -sL https://services.gradle.org/distributions/gradle-8.7-bin.zip -o /tmp/gradle.zip
+          unzip -q /tmp/gradle.zip -d /tmp
+      - name: Build debug APK
+        script: |
+          /tmp/gradle-8.7/bin/gradle assembleDebug --no-daemon
+    artifacts:
+      - app/build/outputs/**/*.apk
