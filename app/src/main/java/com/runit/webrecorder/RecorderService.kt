@@ -1,10 +1,12 @@
 package com.runit.webrecorder
 
+import android.Manifest
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
 import android.hardware.display.DisplayManager
 import android.hardware.display.VirtualDisplay
@@ -18,6 +20,7 @@ import android.os.IBinder
 import android.os.Looper
 import android.widget.Toast
 import androidx.core.app.NotificationCompat
+import androidx.core.content.ContextCompat
 import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -35,12 +38,21 @@ class RecorderService : Service() {
 
         @Volatile
         var isRecording = false
+
+        @Volatile
+        var isSaving = false
     }
 
+    private val mainHandler = Handler(Looper.getMainLooper())
+
     private var projection: MediaProjection? = null
+    private var projectionCallback: MediaProjection.Callback? = null
     private var recorder: MediaRecorder? = null
     private var virtualDisplay: VirtualDisplay? = null
-    private var outputFile: File? = null
+    private var audioCapture: AudioCapture? = null
+    private var videoFile: File? = null
+    private var audioFile: File? = null
+    private var finalFile: File? = null
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -48,14 +60,12 @@ class RecorderService : Service() {
         when (intent?.action) {
             ACTION_START -> startRecording(intent)
             ACTION_STOP -> stopRecording()
-            else -> stopSelf()
+            else -> if (!isRecording && !isSaving) stopSelf()
         }
         return START_NOT_STICKY
     }
 
     private fun startRecording(intent: Intent) {
-        if (isRecording) return
-
         createChannel()
         val notification = buildNotification()
         if (Build.VERSION.SDK_INT >= 29) {
@@ -66,6 +76,11 @@ class RecorderService : Service() {
             )
         } else {
             startForeground(NOTIF_ID, notification)
+        }
+
+        if (isRecording || isSaving) {
+            toast(if (isSaving) "Still saving previous recording" else "Already recording")
+            return
         }
 
         val resultCode = intent.getIntExtra(EXTRA_RESULT_CODE, 0)
@@ -88,11 +103,13 @@ class RecorderService : Service() {
             projection = proj
 
             // Required on Android 14+ before creating the virtual display
-            proj.registerCallback(object : MediaProjection.Callback() {
+            val cb = object : MediaProjection.Callback() {
                 override fun onStop() {
                     stopRecording()
                 }
-            }, Handler(Looper.getMainLooper()))
+            }
+            projectionCallback = cb
+            proj.registerCallback(cb, mainHandler)
 
             val metrics = resources.displayMetrics
             val width = metrics.widthPixels / 2 * 2
@@ -102,8 +119,11 @@ class RecorderService : Service() {
             val dir = getExternalFilesDir(Environment.DIRECTORY_MOVIES) ?: filesDir
             dir.mkdirs()
             val stamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
-            val file = File(dir, "rec_$stamp.mp4")
-            outputFile = file
+            val vFile = File(dir, "vid_$stamp.mp4")
+            val aFile = File(dir, "aud_$stamp.m4a")
+            videoFile = vFile
+            audioFile = aFile
+            finalFile = File(dir, "rec_$stamp.mp4")
 
             val rec = if (Build.VERSION.SDK_INT >= 31) MediaRecorder(this) else MediaRecorder()
             rec.setVideoSource(MediaRecorder.VideoSource.SURFACE)
@@ -112,7 +132,7 @@ class RecorderService : Service() {
             rec.setVideoSize(width, height)
             rec.setVideoFrameRate(30)
             rec.setVideoEncodingBitRate(4_000_000)
-            rec.setOutputFile(file.absolutePath)
+            rec.setOutputFile(vFile.absolutePath)
             rec.prepare()
             recorder = rec
 
@@ -127,6 +147,22 @@ class RecorderService : Service() {
                 null
             )
 
+            // Internal audio (Android 10+ and mic permission needed)
+            val micOk = ContextCompat.checkSelfPermission(
+                this, Manifest.permission.RECORD_AUDIO
+            ) == PackageManager.PERMISSION_GRANTED
+
+            if (Build.VERSION.SDK_INT >= 29 && micOk) {
+                val ac = AudioCapture(proj)
+                if (ac.start(aFile)) {
+                    audioCapture = ac
+                } else {
+                    toast("Audio capture unavailable, recording video only")
+                }
+            } else {
+                toast("No audio permission, recording video only")
+            }
+
             rec.start()
             isRecording = true
             toast("Recording started")
@@ -139,35 +175,100 @@ class RecorderService : Service() {
 
     private fun stopRecording() {
         if (!isRecording) {
-            cleanup()
-            stopSelf()
+            if (!isSaving) {
+                cleanup()
+                stopSelf()
+            }
             return
         }
+
         isRecording = false
+        isSaving = true
 
-        try {
-            recorder?.stop()
-        } catch (e: RuntimeException) {
-            // stopped too quickly, file may be empty
-            outputFile?.delete()
-            outputFile = null
+        // Hand everything to a background thread so the UI doesn't freeze
+        val rec = recorder
+        val vd = virtualDisplay
+        val proj = projection
+        val cb = projectionCallback
+        val audio = audioCapture
+        val video = videoFile
+        val audioF = audioFile
+        val out = finalFile
+
+        recorder = null
+        virtualDisplay = null
+        projection = null
+        projectionCallback = null
+        audioCapture = null
+
+        Thread {
+            audio?.stop()
+
+            var videoOk = true
+            try { rec?.stop() } catch (e: RuntimeException) { videoOk = false }
+            try { rec?.release() } catch (_: Exception) {}
+            try { vd?.release() } catch (_: Exception) {}
+            try { if (cb != null) proj?.unregisterCallback(cb) } catch (_: Exception) {}
+            try { proj?.stop() } catch (_: Exception) {}
+
+            val msg = finishFiles(
+                videoOk,
+                video,
+                audioF,
+                out,
+                audio != null,
+                audio?.hasData == true
+            )
+            toast(msg)
+
+            isSaving = false
+            mainHandler.post {
+                stopForeground(STOP_FOREGROUND_REMOVE)
+                stopSelf()
+            }
+        }.start()
+    }
+
+    private fun finishFiles(
+        videoOk: Boolean,
+        video: File?,
+        audioF: File?,
+        out: File?,
+        audioStarted: Boolean,
+        audioHasData: Boolean
+    ): String {
+        if (!videoOk || video == null || out == null || !video.exists() || video.length() == 0L) {
+            video?.delete()
+            audioF?.delete()
+            return "Recording too short, nothing saved"
         }
 
-        val saved = outputFile
-        cleanup()
-
-        if (saved != null) {
-            toast("Saved: ${saved.name}")
+        if (audioStarted && audioHasData && audioF != null && audioF.exists()) {
+            if (MediaMerger.merge(video, audioF, out)) {
+                video.delete()
+                audioF.delete()
+                return "Saved: ${out.name}"
+            }
+            out.delete()
         }
-        stopForeground(STOP_FOREGROUND_REMOVE)
-        stopSelf()
+
+        video.renameTo(out)
+        audioF?.delete()
+        return "Saved without audio: ${out.name}"
     }
 
     private fun cleanup() {
+        try { audioCapture?.stop() } catch (_: Exception) {}
+        audioCapture = null
         try { recorder?.release() } catch (_: Exception) {}
         recorder = null
         try { virtualDisplay?.release() } catch (_: Exception) {}
         virtualDisplay = null
+        try {
+            val cb = projectionCallback
+            if (cb != null) projection?.unregisterCallback(cb)
+        } catch (_: Exception) {}
+        projectionCallback = null
         try { projection?.stop() } catch (_: Exception) {}
         projection = null
         isRecording = false
@@ -203,13 +304,13 @@ class RecorderService : Service() {
         .build()
 
     private fun toast(msg: String) {
-        Handler(Looper.getMainLooper()).post {
+        mainHandler.post {
             Toast.makeText(applicationContext, msg, Toast.LENGTH_SHORT).show()
         }
     }
 
     override fun onDestroy() {
-        cleanup()
+        if (!isSaving) cleanup()
         super.onDestroy()
     }
 }
