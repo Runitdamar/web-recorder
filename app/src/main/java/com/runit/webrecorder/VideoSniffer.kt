@@ -137,7 +137,7 @@ class VideoSniffer {
         val name = fileName(item.url)
         val mime = mimeFor(name)
 
-        var out: OutputStream? = null
+        var opened: OutputStream? = null
         var uri: android.net.Uri? = null
         var plainFile: File? = null
         val resolver = ctx.contentResolver
@@ -155,14 +155,16 @@ class VideoSniffer {
                 }
                 uri = resolver.insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, values)
                 if (uri == null) return "Download failed: cannot create file"
-                out = resolver.openOutputStream(uri)
+                opened = resolver.openOutputStream(uri)
             } else {
                 val dir = ctx.getExternalFilesDir(Environment.DIRECTORY_MOVIES) ?: ctx.filesDir
                 dir.mkdirs()
                 plainFile = File(dir, name)
-                out = plainFile.outputStream()
+                opened = plainFile.outputStream()
             }
-            if (out == null) return "Download failed: cannot open file"
+
+            // Fixed (non-changing) reference, safe to use inside the lambda below
+            val stream: OutputStream = opened ?: return "Download failed: cannot open file"
 
             val buf = ByteArray(64 * 1024)
             var done = 0L
@@ -170,14 +172,14 @@ class VideoSniffer {
                 while (true) {
                     val n = input.read(buf)
                     if (n < 0) break
-                    out.write(buf, 0, n)
+                    stream.write(buf, 0, n)
                     done += n
                     progress = if (total > 0) ((done * 100) / total).toInt() else -1
                 }
             }
-            out.flush()
-            out.close()
-            out = null
+            stream.flush()
+            stream.close()
+            opened = null
 
             if (done == 0L) {
                 if (uri != null) resolver.delete(uri, null, null)
@@ -193,7 +195,7 @@ class VideoSniffer {
             }
             return "Downloaded: $name"
         } catch (e: Exception) {
-            try { out?.close() } catch (_: Exception) {}
+            try { opened?.close() } catch (_: Exception) {}
             if (uri != null) resolver.delete(uri, null, null)
             plainFile?.delete()
             throw e
