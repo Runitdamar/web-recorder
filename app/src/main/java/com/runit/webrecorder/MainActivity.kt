@@ -60,9 +60,9 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    // Notification permission (Android 13+), then continue either way
-    private val notifLauncher = registerForActivityResult(
-        ActivityResultContracts.RequestPermission()
+    // Mic + notification permissions, then continue either way
+    private val permLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions()
     ) {
         askCapture()
     }
@@ -190,21 +190,37 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun toggleRecording() {
+        if (RecorderService.isSaving) {
+            Toast.makeText(this, "Saving, please wait", Toast.LENGTH_SHORT).show()
+            return
+        }
+
         if (RecorderService.isRecording) {
             val svc = Intent(this, RecorderService::class.java).apply {
                 action = RecorderService.ACTION_STOP
             }
             startService(svc)
+            return
+        }
+
+        // Collect missing permissions (mic for audio, notifications on Android 13+)
+        val missing = ArrayList<String>()
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
+            != PackageManager.PERMISSION_GRANTED
+        ) {
+            missing.add(Manifest.permission.RECORD_AUDIO)
+        }
+        if (Build.VERSION.SDK_INT >= 33 &&
+            ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS)
+            != PackageManager.PERMISSION_GRANTED
+        ) {
+            missing.add(Manifest.permission.POST_NOTIFICATIONS)
+        }
+
+        if (missing.isEmpty()) {
+            askCapture()
         } else {
-            if (Build.VERSION.SDK_INT >= 33 &&
-                ContextCompat.checkSelfPermission(
-                    this, Manifest.permission.POST_NOTIFICATIONS
-                ) != PackageManager.PERMISSION_GRANTED
-            ) {
-                notifLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
-            } else {
-                askCapture()
-            }
+            permLauncher.launch(missing.toTypedArray())
         }
     }
 
@@ -214,7 +230,11 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun updateRecButton() {
-        recBtn.text = if (RecorderService.isRecording) "Stop" else "Rec"
+        recBtn.text = when {
+            RecorderService.isSaving -> "Saving"
+            RecorderService.isRecording -> "Stop"
+            else -> "Rec"
+        }
     }
 
     private fun go() {
