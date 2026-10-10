@@ -4,6 +4,7 @@ import android.annotation.SuppressLint
 import android.graphics.Bitmap
 import android.os.Bundle
 import android.view.KeyEvent
+import android.view.View
 import android.view.inputmethod.EditorInfo
 import android.view.inputmethod.InputMethodManager
 import android.webkit.WebChromeClient
@@ -21,7 +22,7 @@ class MainActivity : AppCompatActivity() {
 
     private lateinit var webView: WebView
     private lateinit var urlBar: EditText
-    private lateinit var progress: ProgressBar
+    private lateinit var loadingBar: ProgressBar
 
     @SuppressLint("SetJavaScriptEnabled")
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -42,12 +43,15 @@ class MainActivity : AppCompatActivity() {
             setSingleLine(true)
             imeOptions = EditorInfo.IME_ACTION_GO
             setOnEditorActionListener { _, actionId, event ->
-                if (actionId == EditorInfo.IME_ACTION_GO ||
-                    (event?.keyCode == KeyEvent.KEYCODE_ENTER && event.action == KeyEvent.ACTION_DOWN)
-                ) {
+                val enterPressed = event != null &&
+                    event.keyCode == KeyEvent.KEYCODE_ENTER &&
+                    event.action == KeyEvent.ACTION_DOWN
+                if (actionId == EditorInfo.IME_ACTION_GO || enterPressed) {
                     go()
                     true
-                } else false
+                } else {
+                    false
+                }
             }
         }
         bar.addView(
@@ -69,42 +73,42 @@ class MainActivity : AppCompatActivity() {
         root.addView(bar)
 
         // Loading bar
-        progress = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply {
-            max = 100
-            visibility = android.view.View.GONE
-        }
+        loadingBar = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal)
+        loadingBar.max = 100
+        loadingBar.visibility = View.GONE
         root.addView(
-            progress,
+            loadingBar,
             LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(3))
         )
 
         // WebView
-        webView = WebView(this).apply {
-            settings.javaScriptEnabled = true
-            settings.domStorageEnabled = true
-            settings.mediaPlaybackRequiresUserGesture = false
-            settings.mixedContentMode = WebSettings.MIXED_CONTENT_COMPATIBILITY_MODE
-            settings.setSupportZoom(true)
-            settings.builtInZoomControls = true
-            settings.displayZoomControls = false
+        val wv = WebView(this)
+        wv.settings.javaScriptEnabled = true
+        wv.settings.domStorageEnabled = true
+        wv.settings.mediaPlaybackRequiresUserGesture = false
+        wv.settings.mixedContentMode = WebSettings.MIXED_CONTENT_COMPATIBILITY_MODE
+        wv.settings.setSupportZoom(true)
+        wv.settings.builtInZoomControls = true
+        wv.settings.displayZoomControls = false
 
-            webViewClient = object : WebViewClient() {
-                override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
-                    progress.visibility = android.view.View.VISIBLE
-                    if (url != null) urlBar.setText(url)
-                }
-
-                override fun onPageFinished(view: WebView?, url: String?) {
-                    progress.visibility = android.view.View.GONE
-                }
+        wv.webViewClient = object : WebViewClient() {
+            override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
+                loadingBar.visibility = View.VISIBLE
+                if (url != null) urlBar.setText(url)
             }
 
-            webChromeClient = object : WebChromeClient() {
-                override fun onProgressChanged(view: WebView?, newProgress: Int) {
-                    progress.progress = newProgress
-                }
+            override fun onPageFinished(view: WebView?, url: String?) {
+                loadingBar.visibility = View.GONE
             }
         }
+
+        wv.webChromeClient = object : WebChromeClient() {
+            override fun onProgressChanged(view: WebView?, newProgress: Int) {
+                loadingBar.progress = newProgress
+            }
+        }
+
+        webView = wv
         root.addView(
             webView,
             LinearLayout.LayoutParams(
@@ -122,8 +126,7 @@ class MainActivity : AppCompatActivity() {
                 if (webView.canGoBack()) {
                     webView.goBack()
                 } else {
-                    isEnabled = false
-                    onBackPressedDispatcher.onBackPressed()
+                    finish()
                 }
             }
         })
