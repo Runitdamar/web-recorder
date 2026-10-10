@@ -5,6 +5,7 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
+import android.content.ContentValues
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
@@ -18,6 +19,7 @@ import android.os.Environment
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
+import android.provider.MediaStore
 import android.widget.Toast
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
@@ -247,14 +249,48 @@ class RecorderService : Service() {
             if (MediaMerger.merge(video, audioF, out)) {
                 video.delete()
                 audioF.delete()
-                return "Saved: ${out.name}"
+                return publish(out, "")
             }
             out.delete()
         }
 
         video.renameTo(out)
         audioF?.delete()
-        return "Saved without audio: ${out.name}"
+        return publish(out, " (no audio)")
+    }
+
+    // Copies the finished file into the public Movies/WebRecorder folder (Android 10+)
+    private fun publish(file: File, note: String): String {
+        if (Build.VERSION.SDK_INT >= 29) {
+            try {
+                val values = ContentValues().apply {
+                    put(MediaStore.Video.Media.DISPLAY_NAME, file.name)
+                    put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
+                    put(
+                        MediaStore.Video.Media.RELATIVE_PATH,
+                        Environment.DIRECTORY_MOVIES + "/WebRecorder"
+                    )
+                    put(MediaStore.Video.Media.IS_PENDING, 1)
+                }
+                val resolver = contentResolver
+                val uri = resolver.insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, values)
+                if (uri != null) {
+                    val os = resolver.openOutputStream(uri)
+                    if (os != null) {
+                        os.use { o -> file.inputStream().use { it.copyTo(o) } }
+                        values.clear()
+                        values.put(MediaStore.Video.Media.IS_PENDING, 0)
+                        resolver.update(uri, values, null, null)
+                        file.delete()
+                        return "Saved to Movies/WebRecorder: ${file.name}$note"
+                    } else {
+                        resolver.delete(uri, null, null)
+                    }
+                }
+            } catch (_: Exception) {
+            }
+        }
+        return "Saved: ${file.name}$note"
     }
 
     private fun cleanup() {
