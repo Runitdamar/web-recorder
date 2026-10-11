@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="vio_bg">#F6F6F8</color>
+    <color name="vio_surface">#FFFFFF</color>
+    <color name="vio_text">#111114</color>
+    <color name="vio_subtext">#8A8A93</color>
+    <color name="vio_border">#E8E8EE</color>
+    <color name="vio_accent">#4B42F0</color>
+    <color name="vio_accent_light">#ECEBFF</color>
+    <color name="vio_red">#EF4444</color>
+    <color name="vio_red_light">#FDECEC</color>
+    <color name="vio_avatar">#F1F1F5</color>
+    <color name="vio_dark">#111114</color>
+</resources>
