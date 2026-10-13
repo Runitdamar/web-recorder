@@ -1,30 +1,18 @@
 package com.runit.webrecorder
 
-import android.content.ContentValues
 import android.content.Context
-import android.net.Uri
-import android.os.Build
-import android.os.Environment
-import android.provider.MediaStore
-import android.webkit.CookieManager
 import java.io.File
-import java.io.IOException
-import java.io.OutputStream
-import java.net.HttpURLConnection
-import java.net.URL
-import java.text.SimpleDateFormat
-import java.util.Date
-import java.util.Locale
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
 
 /**
- * Downloads videos one or two at a time and keeps each VideoItem's progress up to date.
- * Files end up in Movies/WebRecorder.
+ * Runs downloads (two at a time) and keeps every VideoItem's progress up to date.
+ * Supports pause / resume / cancel. Finished files go to Movies/WebRecorder.
  */
 object DownloadCenter {
 
-    private val EXTS = listOf(".mp4", ".webm", ".mkv", ".mov", ".m4v", ".3gp")
     private val pool = Executors.newFixedThreadPool(2)
+    private val jobs = ConcurrentHashMap<Int, VideoItem>()
 
     /** Short messages for the UI to show as toasts. */
     @Volatile
@@ -33,157 +21,178 @@ object DownloadCenter {
     @Volatile
     var onChange: (() -> Unit)? = null
 
-    fun enqueue(ctx: Context, item: VideoItem) {
+    /** Every video that was ever started in this run, newest first. */
+    fun all(): List<VideoItem> = jobs.values.sortedByDescending { it.id }
+
+    fun activeCount(): Int = jobs.values.count { it.isBusy() }
+
+    fun enqueue(ctx: Context, item: VideoItem, variant: HlsVariant? = null) {
         if (item.isBusy()) return
+        if (item.problem != null) {
+            onEvent?.invoke(item.problem ?: "Can't download this")
+            return
+        }
+        if (variant != null) item.chosenVariant = variant
+        if (item.state != VideoItem.State.PAUSED) {
+            item.progress = 0
+            item.doneBytes = 0
+        }
+        item.control = 0
         item.state = VideoItem.State.QUEUED
-        item.progress = 0
         item.message = ""
-        onChange?.invoke()
+        item.speedBps = 0
+        item.etaSec = -1
+        jobs[item.id] = item
         val app = ctx.applicationContext
+        DownloadService.sync(app)
+        onChange?.invoke()
         pool.execute { process(app, item) }
     }
 
-    private fun process(ctx: Context, item: VideoItem) {
-        item.state = VideoItem.State.DOWNLOADING
-        onChange?.invoke()
+    fun pause(item: VideoItem) {
+        if (item.isBusy()) {
+            item.control = 1
+        }
+    }
+
+    fun resume(ctx: Context, item: VideoItem) {
+        if (item.state == VideoItem.State.PAUSED) enqueue(ctx, item)
+    }
+
+    fun cancel(ctx: Context, item: VideoItem) {
+        when {
+            item.isBusy() -> item.control = 2
+            item.state == VideoItem.State.PAUSED || item.state == VideoItem.State.FAILED -> {
+                discard(item)
+                item.state = VideoItem.State.IDLE
+                item.progress = 0
+                item.message = ""
+                item.speedBps = 0
+                jobs.remove(item.id)
+                DownloadService.sync(ctx.applicationContext)
+                onChange?.invoke()
+            }
+            else -> {}
+        }
+    }
+
+    /** Remove a finished / failed row from the global list. */
+    fun forget(item: VideoItem) {
+        if (!item.isActive()) {
+            jobs.remove(item.id)
+            onChange?.invoke()
+        }
+    }
+
+    fun tempDir(ctx: Context): File {
+        val d = File(ctx.getExternalFilesDir(null) ?: ctx.cacheDir, "tmp")
+        d.mkdirs()
+        return d
+    }
+
+    /** Called when the app process starts: leftovers from a killed run can't be resumed. */
+    fun cleanTemp(ctx: Context) {
+        if (jobs.isNotEmpty()) return
         try {
-            val name = doDownload(ctx, item)
-            item.message = name
+            tempDir(ctx).listFiles()?.forEach { it.delete() }
+        } catch (_: Exception) {
+        }
+    }
+
+    private fun discard(item: VideoItem) {
+        item.engineState = null
+        // temp files are named <id>.part / <id>_v.bin / <id>_a.bin / <id>.mp4
+        // (the dir is only known with a context, so leftovers are cleaned on next start)
+    }
+
+    private fun process(ctx: Context, item: VideoItem) {
+        val dir = tempDir(ctx)
+        when (item.control) {
+            1 -> {
+                item.state = VideoItem.State.PAUSED
+                item.speedBps = 0
+                finishRound(ctx)
+                return
+            }
+            2 -> {
+                cleanFiles(dir, item)
+                resetToIdle(item)
+                finishRound(ctx)
+                return
+            }
+        }
+
+        item.state = VideoItem.State.DOWNLOADING
+        item.message = if (item.kind == VideoItem.Kind.HLS) "Preparing..." else ""
+        onChange?.invoke()
+
+        try {
+            MetadataFetcher.probeNow(item)
+            if (item.problem != null) throw java.io.IOException(item.problem)
+
+            val tracker = Tracker(item, item.sizeBytes)
+            val result: Pair<File, String> = if (item.kind == VideoItem.Kind.HLS) {
+                item.message = ""
+                HlsDownloader.download(item, dir, tracker)
+            } else {
+                Pair(DirectDownloader.download(item, dir, tracker), Naming.directExt(item))
+            }
+
+            item.message = "Saving..."
+            item.speedBps = 0
+            item.etaSec = -1
+            onChange?.invoke()
+            val name = Naming.baseName(item) + "." + result.second
+            val saved = Publisher.publish(ctx, result.first, name, Naming.mimeFor(result.second))
+            cleanFiles(dir, item)
+            item.engineState = null
+            item.message = saved
             item.progress = 100
             item.state = VideoItem.State.DONE
-            onEvent?.invoke("Saved to Movies/WebRecorder: $name")
+            onEvent?.invoke("Saved to Movies/WebRecorder: $saved")
+            DownloadService.notifyDone(ctx, saved)
+        } catch (e: Interrupted) {
+            if (e.kind == 1) {
+                item.state = VideoItem.State.PAUSED
+                item.speedBps = 0
+                item.etaSec = -1
+            } else {
+                cleanFiles(dir, item)
+                resetToIdle(item)
+            }
         } catch (e: Exception) {
             item.message = e.message ?: "unknown error"
             item.state = VideoItem.State.FAILED
+            item.speedBps = 0
+            item.etaSec = -1
             onEvent?.invoke("Download failed: ${item.message}")
         }
-        onChange?.invoke()
+        item.control = 0
+        finishRound(ctx)
     }
 
-    private fun doDownload(ctx: Context, item: VideoItem): String {
-        val conn = URL(item.url).openConnection() as HttpURLConnection
-        conn.connectTimeout = 15000
-        conn.readTimeout = 30000
-        conn.instanceFollowRedirects = true
-        conn.setRequestProperty("User-Agent", item.userAgent)
-        val ref = item.referer
-        if (!ref.isNullOrEmpty()) conn.setRequestProperty("Referer", ref)
-        val cookie = try {
-            CookieManager.getInstance().getCookie(item.url)
-        } catch (_: Exception) {
-            null
-        }
-        if (!cookie.isNullOrEmpty()) conn.setRequestProperty("Cookie", cookie)
+    private fun resetToIdle(item: VideoItem) {
+        item.engineState = null
+        item.state = VideoItem.State.IDLE
+        item.progress = 0
+        item.message = ""
+        item.speedBps = 0
+        item.etaSec = -1
+        item.control = 0
+        jobs.remove(item.id)
+    }
 
-        val code = conn.responseCode
-        if (code !in 200..299) {
-            conn.disconnect()
-            throw IOException("HTTP $code")
-        }
-        val total = conn.contentLengthLong
-        val name = fileName(item)
-        val mime = mimeFor(name)
-
-        var opened: OutputStream? = null
-        var uri: Uri? = null
-        var plainFile: File? = null
-        val resolver = ctx.contentResolver
-
-        try {
-            if (Build.VERSION.SDK_INT >= 29) {
-                val values = ContentValues()
-                values.put(MediaStore.Video.Media.DISPLAY_NAME, name)
-                values.put(MediaStore.Video.Media.MIME_TYPE, mime)
-                values.put(
-                    MediaStore.Video.Media.RELATIVE_PATH,
-                    Environment.DIRECTORY_MOVIES + "/WebRecorder"
-                )
-                values.put(MediaStore.Video.Media.IS_PENDING, 1)
-                val created = resolver.insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, values)
-                    ?: throw IOException("cannot create file")
-                uri = created
-                opened = resolver.openOutputStream(created)
-            } else {
-                val dir = ctx.getExternalFilesDir(Environment.DIRECTORY_MOVIES) ?: ctx.filesDir
-                dir.mkdirs()
-                val f = File(dir, name)
-                plainFile = f
-                opened = f.outputStream()
-            }
-
-            // Fixed reference, safe to use inside the lambda below
-            val stream: OutputStream = opened ?: throw IOException("cannot open file")
-
-            val buf = ByteArray(64 * 1024)
-            var done = 0L
-            conn.inputStream.use { input ->
-                while (true) {
-                    val n = input.read(buf)
-                    if (n < 0) break
-                    stream.write(buf, 0, n)
-                    done += n
-                    item.progress = if (total > 0) ((done * 100) / total).toInt() else -1
-                }
-            }
-            stream.flush()
-            stream.close()
-            opened = null
-
-            if (done == 0L) {
-                throw IOException("empty file")
-            }
-
-            val finished = uri
-            if (finished != null) {
-                val update = ContentValues()
-                update.put(MediaStore.Video.Media.IS_PENDING, 0)
-                resolver.update(finished, update, null, null)
-            }
-            return name
-        } catch (e: Exception) {
+    private fun cleanFiles(dir: File, item: VideoItem) {
+        for (n in listOf("${item.id}.part", "${item.id}_v.bin", "${item.id}_a.bin", "${item.id}.mp4")) {
             try {
-                opened?.close()
+                File(dir, n).delete()
             } catch (_: Exception) {
             }
-            val broken = uri
-            if (broken != null) {
-                try {
-                    resolver.delete(broken, null, null)
-                } catch (_: Exception) {
-                }
-            }
-            plainFile?.delete()
-            throw e
-        } finally {
-            conn.disconnect()
         }
     }
 
-    private fun fileName(item: VideoItem): String {
-        val stamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
-        var base = item.title.replace(Regex("[^A-Za-z0-9 _-]"), "").trim().replace(' ', '_')
-        if (base.length > 40) base = base.substring(0, 40)
-        if (base.isEmpty()) base = "video"
-
-        val path = item.url.substringBefore('?').substringBefore('#').lowercase(Locale.US)
-        var ext = ".mp4"
-        val fromUrl = EXTS.firstOrNull { path.endsWith(it) }
-        if (fromUrl != null) {
-            ext = fromUrl
-        } else if (item.mime?.contains("webm") == true) {
-            ext = ".webm"
-        }
-        return "${base}_${stamp}_${item.id}$ext"
-    }
-
-    private fun mimeFor(name: String): String {
-        val n = name.lowercase(Locale.US)
-        return when {
-            n.endsWith(".webm") -> "video/webm"
-            n.endsWith(".mkv") -> "video/x-matroska"
-            n.endsWith(".mov") -> "video/quicktime"
-            n.endsWith(".3gp") -> "video/3gpp"
-            else -> "video/mp4"
-        }
+    private fun finishRound(ctx: Context) {
+        DownloadService.sync(ctx)
+        onChange?.invoke()
     }
 }

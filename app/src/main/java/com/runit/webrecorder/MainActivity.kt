@@ -1,6 +1,7 @@
 package com.runit.webrecorder
 
 import android.Manifest
+import java.util.concurrent.atomic.AtomicBoolean
 import android.annotation.SuppressLint
 import android.content.Intent
 import android.content.pm.PackageManager
@@ -64,9 +65,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var seeAll: TextView
     private lateinit var tileRec: View
     private lateinit var tileStop: View
-    private lateinit var imgAuto: ImageView
     private lateinit var lblRec: TextView
-    private lateinit var lblAuto: TextView
     private lateinit var lblDownload: TextView
 
     // Browse
@@ -75,9 +74,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var loadingBar: ProgressBar
     private lateinit var privateBadge: TextView
     private lateinit var tabCount: TextView
-    private lateinit var btnRec: TextView
-    private lateinit var btnAuto: TextView
-    private lateinit var btnDownload: TextView
+    private lateinit var btnTools: ImageView
 
     // Detect card (popup when a video plays)
     private lateinit var detectCard: View
@@ -85,6 +82,9 @@ class MainActivity : AppCompatActivity() {
     private lateinit var dcTitle: TextView
     private lateinit var dcMeta: TextView
     private lateinit var dcAction: TextView
+    private lateinit var dcRecord: TextView
+    private lateinit var dcStatus: TextView
+    private lateinit var dcProgress: ProgressBar
 
     // Tabs screen
     private lateinit var tabsList: LinearLayout
@@ -119,15 +119,11 @@ class MainActivity : AppCompatActivity() {
     // Detect card state
     private var detectItem: VideoItem? = null
     private var detectDoneHandled = false
+    private var lastRec = false
+    private var askedNotif = false
     private val shownKeys = HashSet<String>()
     private val hideCardRunnable = Runnable { detectCard.visibility = View.GONE }
-
-    // Auto-record state
-    private var autoMode = false
-    private var autoPending = false   // capture asked by auto mode
-    private var autoStarted = false   // current recording was started by auto mode
-    private var autoDeclined = false  // user cancelled the popup on this page
-    private var askingCapture = false
+    private val uiPending = AtomicBoolean(false)
 
     private val uiHandler = Handler(Looper.getMainLooper())
     private val syncRunnable = object : Runnable {
@@ -141,11 +137,8 @@ class MainActivity : AppCompatActivity() {
     private val captureLauncher = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult()
     ) { result ->
-        uiHandler.postDelayed({ askingCapture = false }, 2000)
         val data = result.data
         if (result.resultCode == RESULT_OK && data != null) {
-            autoStarted = autoPending
-            autoPending = false
             val svc = Intent(this, RecorderService::class.java).apply {
                 action = RecorderService.ACTION_START
                 putExtra(RecorderService.EXTRA_RESULT_CODE, result.resultCode)
@@ -153,9 +146,6 @@ class MainActivity : AppCompatActivity() {
             }
             ContextCompat.startForegroundService(this, svc)
         } else {
-            if (autoPending) autoDeclined = true
-            autoPending = false
-            autoStarted = false
             toast("Recording cancelled")
         }
     }
@@ -167,6 +157,10 @@ class MainActivity : AppCompatActivity() {
         askCapture()
     }
 
+    private val notifLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
@@ -174,8 +168,17 @@ class MainActivity : AppCompatActivity() {
         bindViews()
         setupClicks()
 
+        DownloadCenter.cleanTemp(this)
         DownloadCenter.onEvent = { msg ->
             uiHandler.post { Toast.makeText(this, msg, Toast.LENGTH_LONG).show() }
+        }
+        DownloadCenter.onChange = {
+            if (uiPending.compareAndSet(false, true)) {
+                uiHandler.post {
+                    uiPending.set(false)
+                    updateUi()
+                }
+            }
         }
 
         onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
@@ -215,9 +218,7 @@ class MainActivity : AppCompatActivity() {
         seeAll = findViewById(R.id.seeAll)
         tileRec = findViewById(R.id.tileRec)
         tileStop = findViewById(R.id.tileStop)
-        imgAuto = findViewById(R.id.imgAuto)
         lblRec = findViewById(R.id.lblRec)
-        lblAuto = findViewById(R.id.lblAuto)
         lblDownload = findViewById(R.id.lblDownload)
 
         webContainer = findViewById(R.id.webContainer)
@@ -225,15 +226,16 @@ class MainActivity : AppCompatActivity() {
         loadingBar = findViewById(R.id.loadingBar)
         privateBadge = findViewById(R.id.privateBadge)
         tabCount = findViewById(R.id.tabCount)
-        btnRec = findViewById(R.id.btnRec)
-        btnAuto = findViewById(R.id.btnAuto)
-        btnDownload = findViewById(R.id.btnDownload)
+        btnTools = findViewById(R.id.btnTools)
 
         detectCard = findViewById(R.id.detectCard)
         dcThumb = findViewById(R.id.dcThumb)
         dcTitle = findViewById(R.id.dcTitle)
         dcMeta = findViewById(R.id.dcMeta)
         dcAction = findViewById(R.id.dcAction)
+        dcRecord = findViewById(R.id.dcRecord)
+        dcStatus = findViewById(R.id.dcStatus)
+        dcProgress = findViewById(R.id.dcProgress)
 
         tabsList = findViewById(R.id.tabsList)
         chips = listOf(
@@ -278,15 +280,10 @@ class MainActivity : AppCompatActivity() {
         }
         tileRec.setOnClickListener { startManual() }
         tileStop.setOnClickListener { stopManual() }
-        findViewById<View>(R.id.tileAuto).setOnClickListener { toggleAuto() }
         findViewById<View>(R.id.tileDownload).setOnClickListener { openDownloads() }
 
-        // Browse pills
-        btnRec.setOnClickListener {
-            if (RecorderService.isRecording) stopManual() else startManual()
-        }
-        btnAuto.setOnClickListener { toggleAuto() }
-        btnDownload.setOnClickListener { openDownloads() }
+        // Browse
+        btnTools.setOnClickListener { showToolsCard() }
         tabCount.setOnClickListener { showScreen(Screen.TABS, 1) }
 
         // Recent
@@ -297,6 +294,7 @@ class MainActivity : AppCompatActivity() {
 
         // Detect card
         dcAction.setOnClickListener { onDetectAction() }
+        dcRecord.setOnClickListener { onCardRecord() }
         findViewById<View>(R.id.dcClose).setOnClickListener { hideDetectCard() }
         detectCard.setOnClickListener { openDownloads() }
 
@@ -437,11 +435,11 @@ class MainActivity : AppCompatActivity() {
 
         val tab = Tab(id, isPrivate, wv, sniffer)
 
-        // Play / ended events from the page (arrive on a background thread)
+        // Video info / play events from the page (arrive on a background thread)
         wv.addJavascriptInterface(
             WebBridge(
-                { src -> uiHandler.post { onVideoPlaying(tab, src) } },
-                { uiHandler.post { onVideoEnded(tab) } }
+                { info, playing -> uiHandler.post { onVideoInfo(tab, info, playing) } },
+                { }
             ),
             "WRBridge"
         )
@@ -457,7 +455,6 @@ class MainActivity : AppCompatActivity() {
                 }
                 if (tab === currentTab) {
                     loadingBar.visibility = View.VISIBLE
-                    autoDeclined = false
                 }
                 view?.evaluateJavascript(VideoSniffer.HOOK_JS, null)
             }
@@ -783,51 +780,22 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    // ---------- Video playing: popup + auto-record ----------
+    // ---------- Video popup card ----------
 
-    private fun onVideoPlaying(tab: Tab, src: String) {
-        val direct = tab.sniffer.addFromPage(src)
-        val isCurrent = tab === currentTab
+    private fun onVideoInfo(tab: Tab, info: PageInfo, playing: Boolean) {
+        val item = tab.sniffer.applyPageInfo(info)
+        if (!playing || tab !== currentTab || screen != Screen.BROWSE) return
+        if (RecorderService.isRecording) return // keep the card out of the recording
 
-        // Auto-record
-        if (isCurrent &&
-            autoMode &&
-            !RecorderService.isRecording &&
-            !RecorderService.isSaving &&
-            !autoDeclined &&
-            !askingCapture
-        ) {
-            autoPending = true
-            startFlow()
-        }
-
-        // Download popup
-        if (isCurrent && screen == Screen.BROWSE) {
-            if (direct != null) {
-                showDetectCard(tab, direct)
-            } else {
-                val seen = tab.sniffer.latest()
-                if (seen != null) {
-                    showDetectCard(tab, seen)
-                } else {
-                    // The network request for the video may arrive a moment after "playing"
-                    uiHandler.postDelayed({
-                        if (tab === currentTab && screen == Screen.BROWSE) {
-                            showDetectCard(tab, tab.sniffer.latest())
-                        }
-                    }, 1500)
+        if (item != null) {
+            showDetectCard(tab, item)
+        } else {
+            // The network request for the video may arrive a moment after "playing"
+            uiHandler.postDelayed({
+                if (tab === currentTab && screen == Screen.BROWSE && !RecorderService.isRecording) {
+                    showDetectCard(tab, tab.sniffer.latest())
                 }
-            }
-        }
-    }
-
-    private fun onVideoEnded(tab: Tab) {
-        if (tab === currentTab && autoMode && autoStarted && RecorderService.isRecording) {
-            autoStarted = false
-            val svc = Intent(this, RecorderService::class.java).apply {
-                action = RecorderService.ACTION_STOP
-            }
-            startService(svc)
+            }, 1500)
         }
     }
 
@@ -839,13 +807,32 @@ class MainActivity : AppCompatActivity() {
     private fun showDetectCard(tab: Tab, item: VideoItem?) {
         val key = "${tab.id}|${item?.url ?: "none"}"
         if (!shownKeys.add(key)) return
+        openCard(tab, item)
+    }
+
+    private fun openCard(tab: Tab, item: VideoItem?) {
         detectItem = item
         detectDoneHandled = false
-        if (item != null) tab.sniffer.loadDetails(item)
+        if (item != null) {
+            tab.sniffer.loadDetails(item)
+            MetadataFetcher.loadPoster(item) { uiHandler.post { updateUi() } }
+        }
         detectCard.visibility = View.VISIBLE
         bindDetectCard()
+        scheduleHide(15000)
+    }
+
+    /** Tools icon in the URL bar: brings the card back (also while recording). */
+    private fun showToolsCard() {
+        val tab = currentTab ?: return
+        if (screen != Screen.BROWSE) return
+        val item = detectItem?.takeIf { !it.hidden || it.isActive() } ?: tab.sniffer.latest()
+        openCard(tab, item)
+    }
+
+    private fun scheduleHide(ms: Long) {
         uiHandler.removeCallbacks(hideCardRunnable)
-        uiHandler.postDelayed(hideCardRunnable, 12000)
+        uiHandler.postDelayed(hideCardRunnable, ms)
     }
 
     private fun hideDetectCard() {
@@ -854,63 +841,143 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun bindDetectCard() {
-        val item = detectItem
+        val rec = RecorderService.isRecording
+        val saving = RecorderService.isSaving
+        dcRecord.text = when {
+            saving -> "Saving..."
+            rec -> "Stop"
+            else -> "Record"
+        }
+        dcRecord.setBackgroundResource(if (rec) R.drawable.bg_btn_red else R.drawable.bg_btn_dark)
+
+        val item = detectItem?.takeIf { !it.hidden || it.isActive() }
         if (item == null) {
-            dcTitle.text = "Video playing"
-            dcMeta.text = "Direct download isn't available"
-            dcAction.text = "Record"
-            dcAction.alpha = 1f
+            dcTitle.text = "No video found yet"
+            dcMeta.text = "Play a video, or record the screen"
+            dcStatus.visibility = View.GONE
+            dcProgress.visibility = View.GONE
+            dcAction.visibility = View.GONE
             applyThumb(dcThumb, null)
             return
         }
-
+        dcAction.visibility = View.VISIBLE
         dcTitle.text = item.title
         dcMeta.text = item.metaLine()
         applyThumb(dcThumb, item.thumb)
 
+        dcAction.alpha = 1f
+        dcStatus.setTextColor(color(R.color.vio_accent))
         when (item.state) {
             VideoItem.State.IDLE -> {
+                dcProgress.visibility = View.GONE
+                val prob = item.problem
+                if (prob != null) {
+                    dcStatus.visibility = View.VISIBLE
+                    dcStatus.text = prob
+                    dcStatus.setTextColor(color(R.color.vio_red))
+                    dcAction.alpha = 0.5f
+                } else {
+                    dcStatus.visibility = View.GONE
+                }
                 dcAction.text = "Download"
-                dcAction.alpha = 1f
             }
             VideoItem.State.FAILED -> {
+                dcProgress.visibility = View.GONE
+                dcStatus.visibility = View.VISIBLE
+                dcStatus.text = item.statusLine()
+                dcStatus.setTextColor(color(R.color.vio_red))
                 dcAction.text = "Retry"
-                dcAction.alpha = 1f
             }
             VideoItem.State.QUEUED -> {
-                dcAction.text = "Queued"
-                dcAction.alpha = 0.6f
+                showProgress(item)
+                dcAction.text = "Cancel"
                 uiHandler.removeCallbacks(hideCardRunnable)
             }
             VideoItem.State.DOWNLOADING -> {
-                val p = item.progress
-                dcAction.text = if (p in 0..100) "$p%" else "..."
-                dcAction.alpha = 0.6f
+                showProgress(item)
+                dcAction.text = "Pause"
+                uiHandler.removeCallbacks(hideCardRunnable)
+            }
+            VideoItem.State.PAUSED -> {
+                showProgress(item)
+                dcAction.text = "Resume"
                 uiHandler.removeCallbacks(hideCardRunnable)
             }
             VideoItem.State.DONE -> {
-                dcAction.text = "Saved"
-                dcAction.alpha = 0.6f
+                dcProgress.visibility = View.GONE
+                dcStatus.visibility = View.VISIBLE
+                dcStatus.text = "Saved to Movies/WebRecorder"
+                dcStatus.setTextColor(color(R.color.vio_green))
+                dcAction.text = "Open list"
                 if (!detectDoneHandled) {
                     detectDoneHandled = true
-                    uiHandler.removeCallbacks(hideCardRunnable)
-                    uiHandler.postDelayed(hideCardRunnable, 2500)
+                    scheduleHide(4000)
                 }
             }
         }
     }
 
+    private fun showProgress(item: VideoItem) {
+        val p = item.progress
+        dcProgress.visibility = View.VISIBLE
+        dcProgress.isIndeterminate = p < 0 || item.state == VideoItem.State.QUEUED
+        if (p in 0..100) dcProgress.progress = p
+        dcStatus.visibility = View.VISIBLE
+        dcStatus.text = item.statusLine()
+    }
+
     private fun onDetectAction() {
-        val item = detectItem
-        if (item == null) {
-            hideDetectCard()
-            startManual()
+        val item = detectItem ?: return
+        when (item.state) {
+            VideoItem.State.IDLE, VideoItem.State.FAILED -> startDownload(item)
+            VideoItem.State.DOWNLOADING -> DownloadCenter.pause(item)
+            VideoItem.State.QUEUED -> DownloadCenter.cancel(this, item)
+            VideoItem.State.PAUSED -> DownloadCenter.resume(this, item)
+            VideoItem.State.DONE -> openDownloads()
+        }
+        bindDetectCard()
+    }
+
+    private fun onCardRecord() {
+        if (RecorderService.isRecording) stopManual() else startManual()
+    }
+
+    /** Starts one download; HLS streams with several qualities ask which one first. */
+    private fun startDownload(item: VideoItem) {
+        if (item.problem != null) {
+            toast(item.problem ?: "Can't download this")
             return
         }
-        if (item.isSelectable()) {
+        askNotificationOnce()
+        val vs = item.variants
+        if (item.kind == VideoItem.Kind.HLS && vs.size > 1) {
+            val labels = vs.map { v ->
+                val br = DownloadUtil.formatBitrate(v.bandwidth)
+                if (br.isEmpty()) v.label else v.label + "  •  " + br
+            }.toTypedArray()
+            AlertDialog.Builder(this)
+                .setTitle("Choose quality")
+                .setItems(labels) { _, which ->
+                    DownloadCenter.enqueue(this, item, vs[which])
+                    toast("Download started")
+                    updateUi()
+                }
+                .setNegativeButton("Cancel", null)
+                .show()
+        } else {
             DownloadCenter.enqueue(this, item)
             toast("Download started")
-            bindDetectCard()
+            updateUi()
+        }
+    }
+
+    private fun askNotificationOnce() {
+        if (askedNotif || Build.VERSION.SDK_INT < 33) return
+        askedNotif = true
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS)
+            != PackageManager.PERMISSION_GRANTED
+        ) {
+            notifLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
         }
     }
 
@@ -929,9 +996,18 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    /** This tab's videos plus every download started in this run; active ones first. */
     private fun currentItems(): List<VideoItem> {
-        val tab = currentTab ?: return emptyList()
-        return tab.sniffer.list().reversed() // newest first
+        val map = LinkedHashMap<Int, VideoItem>()
+        val tab = currentTab
+        if (tab != null) for (v in tab.sniffer.list()) map[v.id] = v
+        for (v in DownloadCenter.all()) map[v.id] = v
+        fun rank(v: VideoItem): Int = when {
+            v.isActive() -> 0
+            v.state == VideoItem.State.IDLE -> 1
+            else -> 2
+        }
+        return map.values.sortedWith(compareBy<VideoItem>({ rank(it) }, { -it.id }))
     }
 
     private fun renderDownloads() {
@@ -948,7 +1024,8 @@ class MainActivity : AppCompatActivity() {
                 row.setOnClickListener { toggleSelect(item) }
                 dlList.addView(row)
                 rowViews[item.id] = row
-                currentTab?.sniffer?.loadDetails(item)
+                MetadataFetcher.loadDetails(item) { uiHandler.post { updateUi() } }
+                MetadataFetcher.loadPoster(item) { uiHandler.post { updateUi() } }
             }
             shownIds = ids
         }
@@ -973,50 +1050,63 @@ class MainActivity : AppCompatActivity() {
         val status = row.findViewById<TextView>(R.id.vStatus)
         val check = row.findViewById<CheckBox>(R.id.vCheck)
         val done = row.findViewById<ImageView>(R.id.vDone)
+        val action = row.findViewById<ImageView>(R.id.vAction)
+        val cancel = row.findViewById<ImageView>(R.id.vCancel)
+
+        status.setTextColor(color(R.color.vio_accent))
+        action.visibility = View.GONE
+        cancel.visibility = View.GONE
+        done.visibility = View.GONE
+        check.visibility = View.GONE
+        progress.visibility = View.GONE
+        status.visibility = View.GONE
 
         when (item.state) {
             VideoItem.State.IDLE -> {
-                progress.visibility = View.GONE
-                status.visibility = View.GONE
-                done.visibility = View.GONE
-                check.visibility = View.VISIBLE
-                check.isChecked = item.selected
+                val prob = item.problem
+                if (prob != null) {
+                    status.visibility = View.VISIBLE
+                    status.text = prob
+                    status.setTextColor(color(R.color.vio_red))
+                } else {
+                    check.visibility = View.VISIBLE
+                    check.isChecked = item.selected
+                }
             }
-            VideoItem.State.QUEUED -> {
-                progress.visibility = View.GONE
-                status.visibility = View.VISIBLE
-                status.text = "Queued"
-                status.setTextColor(color(R.color.vio_accent))
-                check.visibility = View.GONE
-                done.visibility = View.GONE
-            }
-            VideoItem.State.DOWNLOADING -> {
+            VideoItem.State.QUEUED, VideoItem.State.DOWNLOADING, VideoItem.State.PAUSED -> {
                 val p = item.progress
                 progress.visibility = View.VISIBLE
-                progress.isIndeterminate = p < 0
+                progress.isIndeterminate = p < 0 || item.state == VideoItem.State.QUEUED
                 if (p in 0..100) progress.progress = p
                 status.visibility = View.VISIBLE
-                status.text = if (p in 0..100) "Downloading $p%" else "Downloading..."
-                status.setTextColor(color(R.color.vio_accent))
-                check.visibility = View.GONE
-                done.visibility = View.GONE
+                status.text = item.statusLine()
+                cancel.visibility = View.VISIBLE
+                cancel.setOnClickListener { DownloadCenter.cancel(this, item); updateUi() }
+                if (item.state != VideoItem.State.QUEUED) {
+                    action.visibility = View.VISIBLE
+                    if (item.state == VideoItem.State.PAUSED) {
+                        action.setImageResource(R.drawable.ic_play)
+                        action.setOnClickListener { DownloadCenter.resume(this, item); updateUi() }
+                    } else {
+                        action.setImageResource(R.drawable.ic_pause)
+                        action.setOnClickListener { DownloadCenter.pause(item); updateUi() }
+                    }
+                }
             }
             VideoItem.State.DONE -> {
-                progress.visibility = View.GONE
                 status.visibility = View.VISIBLE
                 status.text = "Saved to Movies/WebRecorder"
                 status.setTextColor(color(R.color.vio_green))
-                check.visibility = View.GONE
                 done.visibility = View.VISIBLE
             }
             VideoItem.State.FAILED -> {
-                progress.visibility = View.GONE
                 status.visibility = View.VISIBLE
-                status.text = "Failed: ${item.message}. Select to retry"
+                status.text = item.statusLine() + ". Tap to retry"
                 status.setTextColor(color(R.color.vio_red))
-                done.visibility = View.GONE
                 check.visibility = View.VISIBLE
                 check.isChecked = item.selected
+                cancel.visibility = View.VISIBLE
+                cancel.setOnClickListener { DownloadCenter.cancel(this, item); updateUi() }
             }
         }
     }
@@ -1059,6 +1149,7 @@ class MainActivity : AppCompatActivity() {
             toast("Select at least one video")
             return
         }
+        askNotificationOnce()
         for (item in chosen) {
             item.selected = false
             DownloadCenter.enqueue(this, item)
@@ -1069,13 +1160,6 @@ class MainActivity : AppCompatActivity() {
 
     // ---------- Recording ----------
 
-    private fun toggleAuto() {
-        autoMode = !autoMode
-        autoDeclined = false
-        updateUi()
-        toast(if (autoMode) "Auto-record ON: starts when a video plays" else "Auto-record OFF")
-    }
-
     private fun startManual() {
         if (RecorderService.isSaving) {
             toast("Saving, please wait")
@@ -1085,7 +1169,6 @@ class MainActivity : AppCompatActivity() {
             toast("Already recording")
             return
         }
-        autoPending = false
         startFlow()
     }
 
@@ -1094,7 +1177,6 @@ class MainActivity : AppCompatActivity() {
             toast("Not recording")
             return
         }
-        autoStarted = false
         val svc = Intent(this, RecorderService::class.java).apply {
             action = RecorderService.ACTION_STOP
         }
@@ -1103,8 +1185,6 @@ class MainActivity : AppCompatActivity() {
 
     // Checks permissions, then shows the system capture popup
     private fun startFlow() {
-        askingCapture = true
-
         val missing = ArrayList<String>()
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
             != PackageManager.PERMISSION_GRANTED
@@ -1136,7 +1216,7 @@ class MainActivity : AppCompatActivity() {
         val rec = RecorderService.isRecording
         val saving = RecorderService.isSaving
         val items = currentTab?.sniffer?.list() ?: emptyList()
-        val active = items.filter { it.isBusy() }
+        val active = DownloadCenter.all().filter { it.isBusy() }
         val dlText = if (active.isNotEmpty()) {
             val p = active[0].progress
             if (p in 0..100) "$p%" else "..."
@@ -1148,22 +1228,15 @@ class MainActivity : AppCompatActivity() {
         lblRec.text = if (saving) "Saving" else "Rec"
         tileRec.setBackgroundResource(if (rec) R.drawable.bg_tile_rec else R.drawable.bg_tile)
         tileStop.alpha = if (rec) 1f else 0.4f
-        imgAuto.setImageResource(if (autoMode) R.drawable.ic_toggle_on else R.drawable.ic_toggle_off)
-        imgAuto.setColorFilter(color(if (autoMode) R.color.vio_accent else R.color.vio_subtext))
-        lblAuto.text = if (autoMode) "Auto\nON" else "Auto\nOFF"
         lblDownload.text = "Download\n$dlText"
 
-        // Browse pills
-        btnRec.text = when {
-            saving -> "Saving"
-            rec -> "Stop"
-            else -> "Rec"
-        }
-        btnRec.setBackgroundResource(if (rec) R.drawable.bg_pill_active else R.drawable.bg_pill)
-        btnAuto.text = if (autoMode) "Auto: ON" else "Auto: OFF"
-        btnAuto.setBackgroundResource(if (autoMode) R.drawable.bg_pill_active else R.drawable.bg_pill)
-        btnDownload.text = if (active.isNotEmpty()) "Downloading $dlText" else "Download (${items.size})"
+        // URL bar tools icon: red while recording
+        btnTools.setColorFilter(color(if (rec) R.color.vio_red else R.color.vio_accent))
         tabCount.text = "${tabs.size}"
+
+        // Recording just started: tuck the card away so it isn't in the video
+        if (rec && !lastRec && detectCard.visibility == View.VISIBLE) scheduleHide(2500)
+        lastRec = rec
 
         if (screen == Screen.DOWNLOADS) renderDownloads()
         if (detectCard.visibility == View.VISIBLE) bindDetectCard()
@@ -1190,6 +1263,7 @@ class MainActivity : AppCompatActivity() {
 
     override fun onDestroy() {
         DownloadCenter.onEvent = null
+        DownloadCenter.onChange = null
         for (t in tabs) {
             try {
                 t.webView.destroy()

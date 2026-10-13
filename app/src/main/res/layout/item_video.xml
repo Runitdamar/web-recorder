@@ -71,11 +71,35 @@
             android:layout_height="wrap_content"
             android:layout_marginTop="4dp"
             android:ellipsize="end"
-            android:maxLines="1"
+            android:maxLines="2"
             android:textColor="@color/vio_accent"
             android:textSize="12sp"
             android:visibility="gone" />
     </LinearLayout>
+
+    <ImageView
+        android:id="@+id/vAction"
+        android:layout_width="36dp"
+        android:layout_height="36dp"
+        android:background="@drawable/bg_btn_light"
+        android:clickable="true"
+        android:focusable="true"
+        android:padding="9dp"
+        android:src="@drawable/ic_pause"
+        android:tint="@color/vio_accent"
+        android:visibility="gone" />
+
+    <ImageView
+        android:id="@+id/vCancel"
+        android:layout_width="36dp"
+        android:layout_height="36dp"
+        android:layout_marginStart="6dp"
+        android:clickable="true"
+        android:focusable="true"
+        android:padding="9dp"
+        android:src="@drawable/ic_close"
+        android:tint="@color/vio_subtext"
+        android:visibility="gone" />
 
     <CheckBox
         android:id="@+id/vCheck"

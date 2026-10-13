@@ -324,7 +324,7 @@ class RecorderService : Service() {
 
     private fun buildNotification() = NotificationCompat.Builder(this, CHANNEL_ID)
         .setSmallIcon(android.R.drawable.presence_video_online)
-        .setContentTitle("Web Recorder")
+        .setContentTitle("Vio")
         .setContentText("Recording screen...")
         .setOngoing(true)
         .addAction(
